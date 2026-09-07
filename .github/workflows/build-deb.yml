@@ -3,6 +3,11 @@ name: Build & Release Antigravity Debian Packages
 on:
   workflow_dispatch:
     inputs:
+      force_build:
+        description: "Force build even if versions are already up-to-date"
+        required: false
+        default: false
+        type: boolean
       product:
         description: "Product to package"
         required: true
@@ -21,16 +26,6 @@ on:
           - "both"
           - "amd64"
           - "arm64"
-      version_antigravity:
-        description: "Antigravity 2.0 version (or 'latest')"
-        required: true
-        default: "latest"
-        type: string
-      version_ide:
-        description: "Antigravity IDE version (or 'latest')"
-        required: true
-        default: "latest"
-        type: string
       publish_release:
         description: "Publish as GitHub Release"
         required: true
@@ -47,65 +42,68 @@ permissions:
 
 jobs:
   resolve:
-    name: Resolve Releases
+    name: Check Updates & Resolve Matrix
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-      hub_version: ${{ steps.set-matrix.outputs.hub_version }}
-      ide_version: ${{ steps.set-matrix.outputs.ide_version }}
-      should_build: ${{ steps.set-matrix.outputs.should_build }}
-      publish_release: ${{ steps.set-matrix.outputs.publish_release }}
+      matrix: ${{ steps.check.outputs.matrix }}
+      hub_version: ${{ steps.check.outputs.hub_version }}
+      ide_version: ${{ steps.check.outputs.ide_version }}
+      should_build: ${{ steps.check.outputs.should_build }}
+      updated: ${{ steps.check.outputs.updated }}
+      publish_release: ${{ steps.check.outputs.publish_release }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Resolve Upstream Versions & Matrix
-        id: set-matrix
+      - name: Check for Upstream Updates
+        id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          FORCE="${{ github.event.inputs.force_build == 'true' }}"
           PROD="${{ github.event.inputs.product || 'both' }}"
           ARCH="${{ github.event.inputs.arch || 'both' }}"
-          V_HUB="${{ github.event.inputs.version_antigravity || 'latest' }}"
-          V_IDE="${{ github.event.inputs.version_ide || 'latest' }}"
           PUBLISH="${{ github.event.inputs.publish_release != 'false' }}"
 
-          echo "[*] Resolving matrix..."
-          MATRIX_JSON=$(python3 build_deb.py --matrix-json \
+          EXTRA_ARGS=""
+          if [ "$FORCE" = "true" ]; then
+            EXTRA_ARGS="--force"
+          fi
+
+          echo "[*] Checking for latest versions and updates..."
+          MATRIX_JSON=$(python3 build_deb.py --check-update $EXTRA_ARGS \
             --product "$PROD" \
             --arch "$ARCH" \
-            --version-antigravity "$V_HUB" \
-            --version-ide "$V_IDE")
+            --version-file versions.json \
+            --matrix-json)
 
-          echo "Matrix: $MATRIX_JSON"
+          echo "Matrix Output: $MATRIX_JSON"
 
+          UPDATED=$(echo "$MATRIX_JSON" | jq -r .updated)
+          SHOULD_BUILD=$(echo "$MATRIX_JSON" | jq -r .should_build)
           HUB_VER=$(echo "$MATRIX_JSON" | jq -r .hub_version)
           IDE_VER=$(echo "$MATRIX_JSON" | jq -r .ide_version)
           MATRIX=$(echo "$MATRIX_JSON" | jq -c .matrix)
 
-          SHOULD_BUILD="true"
-
-          # If scheduled trigger, check whether this release already exists
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            TAG="v${HUB_VER}-${IDE_VER}"
-            if gh release view "$TAG" >/dev/null 2>&1; then
-              echo "[i] Release $TAG already exists. Skipping build."
-              SHOULD_BUILD="false"
-            else
-              echo "[+] New release detected: $TAG"
-            fi
-          fi
-
-          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "updated=$UPDATED" >> $GITHUB_OUTPUT
+          echo "should_build=$SHOULD_BUILD" >> $GITHUB_OUTPUT
           echo "hub_version=$HUB_VER" >> $GITHUB_OUTPUT
           echo "ide_version=$IDE_VER" >> $GITHUB_OUTPUT
-          echo "should_build=$SHOULD_BUILD" >> $GITHUB_OUTPUT
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
           echo "publish_release=$PUBLISH" >> $GITHUB_OUTPUT
+
+          if [ "$SHOULD_BUILD" != "true" ]; then
+            echo "::notice ::No updates found (Antigravity 2.0: $HUB_VER, Antigravity IDE: $IDE_VER). Skipping download and packaging."
+          else
+            echo "::notice ::Updates detected! Building targets: $(echo "$MATRIX_JSON" | jq -c .updated_products)"
+          fi
 
   build:
     name: Build ${{ matrix.product }} (${{ matrix.arch }})
@@ -128,20 +126,13 @@ jobs:
       - name: Build Debian Package
         run: |
           mkdir -p dist
-          V_FLAG=""
-          if [ "${{ matrix.product }}" = "antigravity" ]; then
-            V_FLAG="--version-antigravity ${{ matrix.version }}"
-          else
-            V_FLAG="--version-ide ${{ matrix.version }}"
-          fi
-
           python3 build_deb.py \
             --product "${{ matrix.product }}" \
             --arch "${{ matrix.arch }}" \
-            $V_FLAG \
+            --force \
             --out-dir dist
 
-      - name: Upload Artifact
+      - name: Upload Package Artifact
         uses: actions/upload-artifact@v4
         with:
           name: deb-${{ matrix.product }}-${{ matrix.version }}-${{ matrix.arch }}
@@ -150,13 +141,15 @@ jobs:
           retention-days: 7
 
   release:
-    name: Publish Release & Checksums
+    name: Publish Release & Update Versions
     needs: [resolve, build]
     if: needs.resolve.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -173,13 +166,11 @@ jobs:
         run: |
           cd dist
           sha256sum *.deb > SHA256SUMS.txt
-          echo "Checksums:"
+          echo "=== Checksums ==="
           cat SHA256SUMS.txt
           cd ..
 
-          python3 build_deb.py --generate-release-notes release_notes.md \
-            --version-antigravity "${{ needs.resolve.outputs.hub_version }}" \
-            --version-ide "${{ needs.resolve.outputs.ide_version }}"
+          python3 build_deb.py --generate-release-notes release_notes.md
 
       - name: Upload All Packages Artifact
         uses: actions/upload-artifact@v4
@@ -193,8 +184,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="v${{ needs.resolve.outputs.hub_version }}-${{ needs.resolve.outputs.ide_version }}"
-          TITLE="Google Antigravity 2.0 (v${{ needs.resolve.outputs.hub_version }}) & IDE (v${{ needs.resolve.outputs.ide_version }})"
+          HUB_VER="${{ needs.resolve.outputs.hub_version }}"
+          IDE_VER="${{ needs.resolve.outputs.ide_version }}"
+          TAG="v${HUB_VER}-${IDE_VER}"
+          TITLE="Google Antigravity 2.0 (v${HUB_VER}) & IDE (v${IDE_VER})"
 
           echo "[*] Publishing release $TAG..."
           if gh release view "$TAG" >/dev/null 2>&1; then
@@ -206,4 +199,21 @@ jobs:
             gh release create "$TAG" dist/* \
               --title "$TITLE" \
               --notes-file release_notes.md
+          fi
+
+      - name: Commit and Push Updated versions.json
+        run: |
+          HUB_VER="${{ needs.resolve.outputs.hub_version }}"
+          IDE_VER="${{ needs.resolve.outputs.ide_version }}"
+
+          echo "{\"antigravity\": \"$HUB_VER\", \"antigravity-ide\": \"$IDE_VER\"}" > versions.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add versions.json
+          if git diff --staged --quiet; then
+            echo "[i] versions.json unchanged. Nothing to commit."
+          else
+            git commit -m "chore: bump tracked versions to Antigravity $HUB_VER, IDE $IDE_VER [skip ci]"
+            git push
           fi

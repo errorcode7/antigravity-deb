@@ -5,6 +5,8 @@ Antigravity & Antigravity IDE Debian Package (.deb) Repackager
 Features:
 - Queries releases from https://antigravity.google/releases and official Cloud Run auto-updater APIs.
 - Resolves download URLs for Antigravity 2.0 and Antigravity IDE (Linux amd64 & arm64).
+- Checks whether upstream versions have updated before downloading.
+- If versions are already up-to-date, exits immediately without parsing/downloading archives.
 - Downloads tar.gz archives with streaming progress and resume support.
 - Extracts and arranges payload into standard Debian package structure:
     /opt/<pkg-name>/
@@ -85,6 +87,23 @@ def parse_version_tuple(v_str: str) -> Tuple[int, ...]:
     return tuple(nums) if nums else (0,)
 
 
+def compare_versions(v1: str, v2: str) -> int:
+    """
+    Compare semver strings.
+    Returns 1 if v1 > v2, -1 if v1 < v2, 0 if v1 == v2.
+    """
+    t1 = parse_version_tuple(v1)
+    t2 = parse_version_tuple(v2)
+    max_len = max(len(t1), len(t2))
+    t1_padded = t1 + (0,) * (max_len - len(t1))
+    t2_padded = t2 + (0,) * (max_len - len(t2))
+    if t1_padded > t2_padded:
+        return 1
+    elif t1_padded < t2_padded:
+        return -1
+    return 0
+
+
 class ReleaseResolver:
     """Resolves release information and download URLs."""
 
@@ -151,25 +170,67 @@ class ReleaseResolver:
         return filtered
 
     @staticmethod
+    def get_latest_versions() -> Dict[str, Dict[str, str]]:
+        """Retrieve latest release info for both Antigravity 2.0 and Antigravity IDE."""
+        hub = ReleaseResolver.fetch_hub_releases()
+        ide = ReleaseResolver.fetch_ide_releases()
+        if not hub:
+            raise RuntimeError("Failed to fetch Antigravity 2.0 releases")
+        if not ide:
+            raise RuntimeError("Failed to fetch Antigravity IDE releases")
+        return {
+            "antigravity": hub[0],
+            "antigravity-ide": ide[0],
+        }
+
+    @staticmethod
     def get_download_url(product: str, version: str, execution_id: str, deb_arch: str) -> str:
         """
         Construct download URL based on product, version, execution_id, and architecture.
         """
         platform = ARCH_MAP.get(deb_arch.lower(), "linux-x64")
         if product == "antigravity":
-            # Antigravity 2.0
             return (
                 f"https://storage.googleapis.com/antigravity-public/antigravity-hub/"
                 f"{version}-{execution_id}/{platform}/Antigravity.tar.gz"
             )
         elif product == "antigravity-ide":
-            # Antigravity IDE
             return (
                 f"https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/"
                 f"{version}-{execution_id}/{platform}/Antigravity%20IDE.tar.gz"
             )
         else:
             raise ValueError(f"Unknown product: {product}")
+
+
+def load_version_file(path: Path) -> Dict[str, str]:
+    """Load recorded versions from file."""
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[WARN] Could not read version file {path}: {e}", file=sys.stderr)
+        return {}
+
+
+def save_version_file(path: Path, data: Dict[str, str]) -> None:
+    """Save updated versions to file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = load_version_file(path)
+    existing.update(data)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(existing, f, indent=2)
+    print(f"[i] Updated version cache in: {path}")
+
+
+def check_github_release_exists(tag: str) -> bool:
+    """Check if a release tag already exists on GitHub."""
+    if shutil.which("gh"):
+        res = subprocess.run(["gh", "release", "view", tag], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return res.returncode == 0
+    return False
 
 
 def download_file(url: str, dest_path: Path) -> Path:
@@ -223,7 +284,6 @@ def download_file(url: str, dest_path: Path) -> Path:
 
     except urllib.error.HTTPError as e:
         if e.code == 416 and temp_path.exists():
-            # Range not satisfiable, file might already be complete
             pass
         else:
             raise
@@ -254,7 +314,7 @@ class DebPackager:
         archive_path: Path,
         output_dir: Path,
     ):
-        self.product = product  # 'antigravity' or 'antigravity-ide'
+        self.product = product
         self.version = version
         self.deb_arch = DEBIAN_ARCH_CANONICAL.get(deb_arch.lower(), "amd64")
         self.archive_path = archive_path
@@ -286,25 +346,24 @@ class DebPackager:
             else:
                 payload_source = extract_dir
 
-            # Installation path in debian system
             opt_app_dir = staging_root / "opt" / self.product
             opt_app_dir.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(payload_source), str(opt_app_dir))
 
             print(f"[*] Setting up packaging structure for {self.product}...")
-            # 1. Setup Executable and /usr/bin/ wrapper
+            # 1. Executable launcher
             exe_name, exe_path = self._setup_executable(opt_app_dir, staging_root)
 
-            # 2. Setup Desktop Entry & Icons
+            # 2. Desktop entry & icons
             self._setup_desktop_and_icons(opt_app_dir, staging_root, exe_name)
 
-            # 3. Setup Permissions
+            # 3. Permissions
             self._fix_permissions(staging_root, opt_app_dir)
 
-            # 4. Setup DEBIAN control & maintainer scripts
+            # 4. Debian metadata
             self._setup_debian_metadata(staging_root)
 
-            # 5. Build .deb package using dpkg-deb
+            # 5. Build .deb package
             print(f"[*] Building deb package: {deb_filename}...")
             subprocess.run(
                 ["dpkg-deb", "--build", "--root-owner-group", str(staging_root), str(final_deb_path)],
@@ -323,7 +382,6 @@ class DebPackager:
 
         target_bin: Optional[Path] = None
 
-        # Check for matching binary names
         candidates = [
             self.product,
             "antigravity",
@@ -337,7 +395,6 @@ class DebPackager:
                 target_bin = p
                 break
 
-        # If not found, inspect ELF executables in root
         if not target_bin:
             for item in opt_app_dir.iterdir():
                 if item.is_file() and not item.is_symlink():
@@ -354,14 +411,11 @@ class DebPackager:
                         pass
 
         if not target_bin:
-            # Fallback to product name
             target_bin = opt_app_dir / self.product
 
-        # Ensure executable permission
         if target_bin.exists():
             target_bin.chmod(target_bin.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-        # Create wrapper launcher script in /usr/bin
         launcher_script = usr_bin / self.product
         opt_bin_path = f"/opt/{self.product}/{target_bin.name}"
 
@@ -373,7 +427,6 @@ exec "{opt_bin_path}" "$@"
             f.write(wrapper_content)
         launcher_script.chmod(0o755)
 
-        # If product is antigravity-ide, also provide alias 'agy-ide'
         if self.product == "antigravity-ide":
             alias_script = usr_bin / "agy-ide"
             with open(alias_script, "w", encoding="utf-8") as f:
@@ -392,7 +445,6 @@ exec "{opt_bin_path}" "$@"
         pixmaps_dir.mkdir(parents=True, exist_ok=True)
         icons_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. Search for best icon
         icon_source: Optional[Path] = None
         icon_candidates = [
             opt_app_dir / "resources" / "app" / "resources" / "linux" / "code.png",
@@ -414,7 +466,6 @@ exec "{opt_bin_path}" "$@"
                     best_size = size
                     icon_source = p
 
-        # Copy icon if found
         icon_name = self.product
         if icon_source and icon_source.is_file():
             shutil.copy2(icon_source, pixmaps_dir / f"{icon_name}.png")
@@ -429,7 +480,6 @@ exec "{opt_bin_path}" "$@"
             with open(fallback_svg, "w", encoding="utf-8") as f:
                 f.write(svg_content)
 
-        # 2. Write Desktop file
         if self.product == "antigravity":
             display_name = "Antigravity"
             comment = "Google Antigravity 2.0 Agentic Desktop Application"
@@ -520,7 +570,6 @@ Description: {description}
             f.write(control_content)
         (debian_dir / "control").chmod(0o644)
 
-        # postinst
         postinst_content = """#!/bin/sh
 set -e
 
@@ -545,7 +594,6 @@ exit 0
             f.write(postinst_content)
         postinst_file.chmod(0o755)
 
-        # postrm
         postrm_content = """#!/bin/sh
 set -e
 
@@ -597,41 +645,73 @@ def list_releases() -> None:
     print()
 
 
-def resolve_product_release(product: str, version_req: str) -> Dict[str, str]:
-    """Find the requested release dictionary for a product."""
-    if product == "antigravity":
-        releases = ReleaseResolver.fetch_hub_releases()
-    elif product == "antigravity-ide":
-        releases = ReleaseResolver.fetch_ide_releases()
-    else:
-        raise ValueError(f"Unknown product: {product}")
+def check_updates(
+    version_file_path: Path,
+    force: bool = False,
+) -> Tuple[bool, Dict[str, Dict[str, str]], List[str]]:
+    """
+    Check if upstream has newer releases than recorded in version_file.
+    Returns:
+        (has_update, latest_releases_map, updated_products_list)
+    """
+    latest_map = ReleaseResolver.get_latest_versions()
+    recorded_versions = load_version_file(version_file_path)
 
-    if not releases:
-        raise RuntimeError(f"Could not retrieve any releases for {product}")
+    updated_products = []
+    print("[*] Checking for updates against recorded versions:", file=sys.stderr)
+    for prod in ["antigravity", "antigravity-ide"]:
+        upstream_ver = latest_map[prod]["version"]
+        rec_ver = recorded_versions.get(prod)
 
-    if version_req == "latest":
-        return releases[0]
+        is_new = False
+        if force:
+            is_new = True
+            reason = "Force build requested"
+        elif not rec_ver:
+            is_new = True
+            reason = "No previous build recorded"
+        elif compare_versions(upstream_ver, rec_ver) > 0:
+            is_new = True
+            reason = f"Upstream ({upstream_ver}) > Recorded ({rec_ver})"
+        else:
+            reason = f"Up to date ({rec_ver})"
 
-    for r in releases:
-        if r["version"] == version_req:
-            return r
+        print(f"    - {prod:16s}: upstream={upstream_ver:<8s} recorded={str(rec_ver):<8s} -> {reason}", file=sys.stderr)
+        if is_new:
+            updated_products.append(prod)
 
-    raise ValueError(f"Version '{version_req}' not found for product '{product}'. Available: {[r['version'] for r in releases[:5]]}")
+    has_update = len(updated_products) > 0
+    return has_update, latest_map, updated_products
 
 
 def generate_matrix_json(
-    product_req: str, arch_req: str, v_hub_req: str, v_ide_req: str
+    product_req: str,
+    arch_req: str,
+    version_file: Path,
+    check_update_mode: bool,
+    force: bool,
 ) -> Dict[str, Any]:
     """Produce matrix JSON for GitHub Actions."""
-    products = ["antigravity", "antigravity-ide"] if product_req == "both" else [product_req]
+    has_update, latest_map, updated_products = check_updates(
+        version_file_path=version_file,
+        force=force,
+    )
+
+    hub_rel = latest_map["antigravity"]
+    ide_rel = latest_map["antigravity-ide"]
+
+    all_products = ["antigravity", "antigravity-ide"] if product_req == "both" else [product_req]
     arches = ["amd64", "arm64"] if arch_req == "both" else [arch_req]
 
-    matrix_list = []
-    hub_rel = resolve_product_release("antigravity", v_hub_req)
-    ide_rel = resolve_product_release("antigravity-ide", v_ide_req)
+    # Filter target products
+    if check_update_mode and not force:
+        target_products = [p for p in all_products if p in updated_products]
+    else:
+        target_products = all_products
 
-    for p in products:
-        rel = hub_rel if p == "antigravity" else ide_rel
+    matrix_list = []
+    for p in target_products:
+        rel = latest_map[p]
         for a in arches:
             matrix_list.append(
                 {
@@ -642,9 +722,13 @@ def generate_matrix_json(
                 }
             )
 
+    should_build = len(matrix_list) > 0
     return {
+        "updated": has_update,
+        "should_build": should_build,
         "hub_version": hub_rel["version"],
         "ide_version": ide_rel["version"],
+        "updated_products": target_products,
         "matrix": matrix_list,
     }
 
@@ -704,26 +788,31 @@ def main() -> None:
         help="List available upstream releases and exit",
     )
     parser.add_argument(
+        "--check-update",
+        action="store_true",
+        help="Check if upstream has new versions before downloading; exits early if no update",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force download and package even if recorded version is already up-to-date",
+    )
+    parser.add_argument(
+        "--version-file",
+        default="./versions.json",
+        help="Path to versions.json tracking file (default: ./versions.json)",
+    )
+    parser.add_argument(
         "--product",
         choices=["antigravity", "antigravity-ide", "both"],
         default="both",
-        help="Product to build (antigravity, antigravity-ide, or both)",
+        help="Product to build (default: both)",
     )
     parser.add_argument(
         "--arch",
         choices=["amd64", "arm64", "both"],
         default="amd64",
-        help="Debian architecture (amd64, arm64, or both)",
-    )
-    parser.add_argument(
-        "--version-antigravity",
-        default="latest",
-        help="Version of Antigravity 2.0 to package (default: latest)",
-    )
-    parser.add_argument(
-        "--version-ide",
-        default="latest",
-        help="Version of Antigravity IDE to package (default: latest)",
+        help="Debian architecture (amd64, arm64, or both; default: amd64)",
     )
     parser.add_argument(
         "--out-dir",
@@ -757,44 +846,70 @@ def main() -> None:
         list_releases()
         return
 
+    version_file = Path(args.version_file).resolve()
+
     if args.matrix_json:
         m = generate_matrix_json(
-            args.product,
-            args.arch,
-            args.version_antigravity,
-            args.version_ide,
+            product_req=args.product,
+            arch_req=args.arch,
+            version_file=version_file,
+            check_update_mode=args.check_update,
+            force=args.force,
         )
         print(json.dumps(m))
         return
 
+    # Check for updates
+    has_update, latest_map, updated_products = check_updates(
+        version_file_path=version_file,
+        force=args.force,
+    )
+
+    if args.check_update and not has_update and not args.force:
+        print("\n[i] All target products are already up-to-date. No new versions found. Exiting.")
+        sys.exit(0)
+
+    # Determine which products to build
+    if args.product == "both":
+        products_to_build = updated_products if (args.check_update and not args.force) else ["antigravity", "antigravity-ide"]
+    else:
+        if args.check_update and not args.force and args.product not in updated_products:
+            print(f"\n[i] Product '{args.product}' is already up-to-date. Exiting.")
+            sys.exit(0)
+        products_to_build = [args.product]
+
+    if not products_to_build:
+        print("\n[i] No products require building.")
+        sys.exit(0)
+
     if args.generate_release_notes:
-        hub_rel = resolve_product_release("antigravity", args.version_antigravity)
-        ide_rel = resolve_product_release("antigravity-ide", args.version_ide)
-        notes = generate_release_notes(hub_rel["version"], ide_rel["version"], Path(args.generate_release_notes))
+        notes = generate_release_notes(
+            latest_map["antigravity"]["version"],
+            latest_map["antigravity-ide"]["version"],
+            Path(args.generate_release_notes),
+        )
         print(notes)
         return
 
-    products = ["antigravity", "antigravity-ide"] if args.product == "both" else [args.product]
     arches = ["amd64", "arm64"] if args.arch == "both" else [args.arch]
-
     out_dir = Path(args.out_dir).resolve()
     cache_dir = Path(args.cache_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     built_packages: List[Path] = []
+    versions_to_save = {}
 
-    for prod in products:
-        v_req = args.version_antigravity if prod == "antigravity" else args.version_ide
-        print(f"\n{'=' * 60}")
-        print(f"Resolving {prod} (target version: {v_req})...")
-        rel = resolve_product_release(prod, v_req)
+    for prod in products_to_build:
+        rel = latest_map[prod]
         ver = rel["version"]
         eid = rel["execution_id"]
-        print(f"Resolved: Version {ver}, Execution ID {eid}")
+        print(f"\n{'=' * 60}")
+        print(f"Target: {prod} (Latest Version: {ver}, Execution ID: {eid})")
+        print(f"{'=' * 60}")
 
         for arch in arches:
-            print(f"\n--- Target: {prod} {ver} ({arch}) ---")
+            print(f"\n--- Building {prod} {ver} ({arch}) ---")
             download_url = ReleaseResolver.get_download_url(prod, ver, eid, arch)
             print(f"Archive URL: {download_url}")
 
@@ -818,23 +933,28 @@ def main() -> None:
             )
             deb_path = packager.package()
             built_packages.append(deb_path)
+            versions_to_save[prod] = ver
 
     if args.only_resolve:
         return
 
-    print(f"\n{'=' * 60}")
-    print("Build Summary:")
-    print(f"{'=' * 60}")
-    sums_file = out_dir / "SHA256SUMS.txt"
-    with open(sums_file, "w", encoding="utf-8") as sf:
-        for deb in built_packages:
-            sha = sha256_file(deb)
-            line = f"{sha}  {deb.name}\n"
-            sf.write(line)
-            print(f"  Package: {deb.name}")
-            print(f"    Path:   {deb}")
-            print(f"    SHA256: {sha}")
-    print(f"\nChecksum file written to: {sums_file}")
+    if built_packages:
+        print(f"\n{'=' * 60}")
+        print("Build Summary:")
+        print(f"{'=' * 60}")
+        sums_file = out_dir / "SHA256SUMS.txt"
+        with open(sums_file, "w", encoding="utf-8") as sf:
+            for deb in built_packages:
+                sha = sha256_file(deb)
+                line = f"{sha}  {deb.name}\n"
+                sf.write(line)
+                print(f"  Package: {deb.name}")
+                print(f"    Path:   {deb}")
+                print(f"    SHA256: {sha}")
+        print(f"\nChecksum file written to: {sums_file}")
+
+        # Update recorded versions
+        save_version_file(version_file, versions_to_save)
 
 
 if __name__ == "__main__":
