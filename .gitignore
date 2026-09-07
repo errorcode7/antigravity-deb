@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Build artifacts
+dist/
+cache/
+*.deb
+*.tar.gz
+*.tmp
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+perf.data

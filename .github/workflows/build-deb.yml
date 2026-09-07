@@ -1,0 +1,209 @@
+name: Build & Release Antigravity Debian Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      product:
+        description: "Product to package"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - "both"
+          - "antigravity"
+          - "antigravity-ide"
+      arch:
+        description: "Target architecture"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - "both"
+          - "amd64"
+          - "arm64"
+      version_antigravity:
+        description: "Antigravity 2.0 version (or 'latest')"
+        required: true
+        default: "latest"
+        type: string
+      version_ide:
+        description: "Antigravity IDE version (or 'latest')"
+        required: true
+        default: "latest"
+        type: string
+      publish_release:
+        description: "Publish as GitHub Release"
+        required: true
+        default: true
+        type: boolean
+
+  schedule:
+    # Daily auto-check at 02:00 UTC
+    - cron: "0 2 * * *"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  resolve:
+    name: Resolve Releases
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      hub_version: ${{ steps.set-matrix.outputs.hub_version }}
+      ide_version: ${{ steps.set-matrix.outputs.ide_version }}
+      should_build: ${{ steps.set-matrix.outputs.should_build }}
+      publish_release: ${{ steps.set-matrix.outputs.publish_release }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve Upstream Versions & Matrix
+        id: set-matrix
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PROD="${{ github.event.inputs.product || 'both' }}"
+          ARCH="${{ github.event.inputs.arch || 'both' }}"
+          V_HUB="${{ github.event.inputs.version_antigravity || 'latest' }}"
+          V_IDE="${{ github.event.inputs.version_ide || 'latest' }}"
+          PUBLISH="${{ github.event.inputs.publish_release != 'false' }}"
+
+          echo "[*] Resolving matrix..."
+          MATRIX_JSON=$(python3 build_deb.py --matrix-json \
+            --product "$PROD" \
+            --arch "$ARCH" \
+            --version-antigravity "$V_HUB" \
+            --version-ide "$V_IDE")
+
+          echo "Matrix: $MATRIX_JSON"
+
+          HUB_VER=$(echo "$MATRIX_JSON" | jq -r .hub_version)
+          IDE_VER=$(echo "$MATRIX_JSON" | jq -r .ide_version)
+          MATRIX=$(echo "$MATRIX_JSON" | jq -c .matrix)
+
+          SHOULD_BUILD="true"
+
+          # If scheduled trigger, check whether this release already exists
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            TAG="v${HUB_VER}-${IDE_VER}"
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "[i] Release $TAG already exists. Skipping build."
+              SHOULD_BUILD="false"
+            else
+              echo "[+] New release detected: $TAG"
+            fi
+          fi
+
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "hub_version=$HUB_VER" >> $GITHUB_OUTPUT
+          echo "ide_version=$IDE_VER" >> $GITHUB_OUTPUT
+          echo "should_build=$SHOULD_BUILD" >> $GITHUB_OUTPUT
+          echo "publish_release=$PUBLISH" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build ${{ matrix.product }} (${{ matrix.arch }})
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.resolve.outputs.matrix) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build Debian Package
+        run: |
+          mkdir -p dist
+          V_FLAG=""
+          if [ "${{ matrix.product }}" = "antigravity" ]; then
+            V_FLAG="--version-antigravity ${{ matrix.version }}"
+          else
+            V_FLAG="--version-ide ${{ matrix.version }}"
+          fi
+
+          python3 build_deb.py \
+            --product "${{ matrix.product }}" \
+            --arch "${{ matrix.arch }}" \
+            $V_FLAG \
+            --out-dir dist
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.product }}-${{ matrix.version }}-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish Release & Checksums
+    needs: [resolve, build]
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download all deb packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate Checksums & Release Notes
+        run: |
+          cd dist
+          sha256sum *.deb > SHA256SUMS.txt
+          echo "Checksums:"
+          cat SHA256SUMS.txt
+          cd ..
+
+          python3 build_deb.py --generate-release-notes release_notes.md \
+            --version-antigravity "${{ needs.resolve.outputs.hub_version }}" \
+            --version-ide "${{ needs.resolve.outputs.ide_version }}"
+
+      - name: Upload All Packages Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: antigravity-deb-packages-all
+          path: dist/*
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: needs.resolve.outputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ needs.resolve.outputs.hub_version }}-${{ needs.resolve.outputs.ide_version }}"
+          TITLE="Google Antigravity 2.0 (v${{ needs.resolve.outputs.hub_version }}) & IDE (v${{ needs.resolve.outputs.ide_version }})"
+
+          echo "[*] Publishing release $TAG..."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "[*] Updating existing release $TAG..."
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes-file release_notes.md
+          else
+            echo "[*] Creating new release $TAG..."
+            gh release create "$TAG" dist/* \
+              --title "$TITLE" \
+              --notes-file release_notes.md
+          fi
