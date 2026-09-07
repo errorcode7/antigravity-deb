@@ -433,6 +433,11 @@ exec "{opt_bin_path}" "$@"
                 f.write(wrapper_content)
             alias_script.chmod(0o755)
 
+            # Legacy compatibility symlink: /opt/antigravity-ide/antigravity -> antigravity-ide
+            alias_bin = opt_app_dir / "antigravity"
+            if not alias_bin.exists():
+                alias_bin.symlink_to(target_bin.name)
+
         return target_bin.name, target_bin
 
     def _setup_desktop_and_icons(self, opt_app_dir: Path, staging_root: Path, exe_name: str) -> None:
@@ -486,19 +491,21 @@ exec "{opt_bin_path}" "$@"
             categories = "Development;Utility;"
             startup_wm_class = "Antigravity"
             mime_type = "x-scheme-handler/antigravity;"
+            exec_cmd = "/usr/bin/antigravity %U"
         else:
             display_name = "Antigravity IDE"
             comment = "Google Antigravity IDE - Code with Agents"
             categories = "Development;IDE;"
             startup_wm_class = "Antigravity IDE"
             mime_type = "text/plain;inode/directory;"
+            exec_cmd = "/usr/bin/antigravity-ide %F"
 
         desktop_file = applications_dir / f"{self.product}.desktop"
         desktop_content = f"""[Desktop Entry]
 Name={display_name}
 Comment={comment}
 GenericName=Text Editor and Agent Workspace
-Exec=/opt/{self.product}/{exe_name} %F
+Exec={exec_cmd}
 Icon={icon_name}
 Type=Application
 StartupNotify=true
@@ -510,6 +517,18 @@ Terminal=false
         with open(desktop_file, "w", encoding="utf-8") as f:
             f.write(desktop_content)
         desktop_file.chmod(0o644)
+
+        # Compatibility symlink: /usr/share/<product> -> /opt/<product>
+        usr_share_dir = staging_root / "usr" / "share"
+        usr_share_link = usr_share_dir / self.product
+        if not usr_share_link.exists() and not usr_share_link.is_symlink():
+            usr_share_link.symlink_to(f"/opt/{self.product}")
+
+        # If product is antigravity-ide, also provide /usr/share/antigravity symlink for legacy shortcuts
+        if self.product == "antigravity-ide":
+            legacy_link = usr_share_dir / "antigravity"
+            if not legacy_link.exists() and not legacy_link.is_symlink():
+                legacy_link.symlink_to(f"/opt/{self.product}")
 
     def _fix_permissions(self, staging_root: Path, opt_app_dir: Path) -> None:
         """Fix permissions for Debian standards and Chrome Sandbox."""
