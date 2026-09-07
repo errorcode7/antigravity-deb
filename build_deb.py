@@ -38,7 +38,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 HUB_RELEASES_API = "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/releases"
 IDE_RELEASES_API = "https://antigravity-ide-auto-updater-974169037036.us-central1.run.app/releases"
+CLI_MANIFEST_API_BASE = "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests"
 OFFICIAL_RELEASES_PAGE = "https://antigravity.google/releases"
+
+ALL_PRODUCTS = ["antigravity", "antigravity-ide", "antigravity-cli"]
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -170,17 +173,46 @@ class ReleaseResolver:
         return filtered
 
     @staticmethod
+    def fetch_cli_releases(deb_arch: str = "amd64") -> List[Dict[str, str]]:
+        """Fetch release info for Antigravity CLI from official manifest."""
+        arch = DEBIAN_ARCH_CANONICAL.get(deb_arch.lower(), "amd64")
+        platform = "linux_arm64" if arch == "arm64" else "linux_amd64"
+        manifest_url = f"{CLI_MANIFEST_API_BASE}/{platform}.json"
+        try:
+            raw = http_get(manifest_url)
+            data = json.loads(raw.decode("utf-8"))
+            version = data.get("version", "")
+            dl_url = data.get("url", "")
+            m = re.search(r"/(\d+\.\d+\.\d+)-([0-9a-zA-Z_]+)/", dl_url)
+            execution_id = m.group(2) if m else "1"
+            return [
+                {
+                    "version": version,
+                    "execution_id": execution_id,
+                    "url": dl_url,
+                    "sha512": data.get("sha512", ""),
+                }
+            ]
+        except Exception as e:
+            print(f"[WARN] Failed to fetch CLI manifest from {manifest_url}: {e}", file=sys.stderr)
+            return []
+
+    @staticmethod
     def get_latest_versions() -> Dict[str, Dict[str, str]]:
-        """Retrieve latest release info for both Antigravity 2.0 and Antigravity IDE."""
+        """Retrieve latest release info for Antigravity 2.0, IDE, and CLI."""
         hub = ReleaseResolver.fetch_hub_releases()
         ide = ReleaseResolver.fetch_ide_releases()
+        cli = ReleaseResolver.fetch_cli_releases()
         if not hub:
             raise RuntimeError("Failed to fetch Antigravity 2.0 releases")
         if not ide:
             raise RuntimeError("Failed to fetch Antigravity IDE releases")
+        if not cli:
+            raise RuntimeError("Failed to fetch Antigravity CLI releases")
         return {
             "antigravity": hub[0],
             "antigravity-ide": ide[0],
+            "antigravity-cli": cli[0],
         }
 
     @staticmethod
@@ -199,6 +231,17 @@ class ReleaseResolver:
                 f"https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/"
                 f"{version}-{execution_id}/{platform}/Antigravity%20IDE.tar.gz"
             )
+        elif product == "antigravity-cli":
+            if deb_arch in ("arm64", "aarch64"):
+                return (
+                    f"https://storage.googleapis.com/antigravity-public/antigravity-cli/"
+                    f"{version}-{execution_id}/linux-arm/cli_linux_arm64.tar.gz"
+                )
+            else:
+                return (
+                    f"https://storage.googleapis.com/antigravity-public/antigravity-cli/"
+                    f"{version}-{execution_id}/linux-x64/cli_linux_x64.tar.gz"
+                )
         else:
             raise ValueError(f"Unknown product: {product}")
 
@@ -339,26 +382,30 @@ class DebPackager:
                 check=True,
             )
 
-            # Locate top-level extracted directory
-            entries = list(extract_dir.iterdir())
-            if len(entries) == 1 and entries[0].is_dir():
-                payload_source = entries[0]
+            if self.product == "antigravity-cli":
+                print(f"[*] Setting up packaging structure for {self.product}...")
+                self._setup_cli_package(extract_dir, staging_root)
             else:
-                payload_source = extract_dir
+                # Locate top-level extracted directory
+                entries = list(extract_dir.iterdir())
+                if len(entries) == 1 and entries[0].is_dir():
+                    payload_source = entries[0]
+                else:
+                    payload_source = extract_dir
 
-            opt_app_dir = staging_root / "opt" / self.product
-            opt_app_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(payload_source), str(opt_app_dir))
+                opt_app_dir = staging_root / "opt" / self.product
+                opt_app_dir.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(payload_source), str(opt_app_dir))
 
-            print(f"[*] Setting up packaging structure for {self.product}...")
-            # 1. Executable launcher
-            exe_name, exe_path = self._setup_executable(opt_app_dir, staging_root)
+                print(f"[*] Setting up packaging structure for {self.product}...")
+                # 1. Executable launcher
+                exe_name, exe_path = self._setup_executable(opt_app_dir, staging_root)
 
-            # 2. Desktop entry & icons
-            self._setup_desktop_and_icons(opt_app_dir, staging_root, exe_name)
+                # 2. Desktop entry & icons
+                self._setup_desktop_and_icons(opt_app_dir, staging_root, exe_name)
 
-            # 3. Permissions
-            self._fix_permissions(staging_root, opt_app_dir)
+                # 3. Permissions
+                self._fix_permissions(staging_root, opt_app_dir)
 
             # 4. Debian metadata
             self._setup_debian_metadata(staging_root)
@@ -374,6 +421,38 @@ class DebPackager:
         print(f"    Size: {final_deb_path.stat().st_size / (1024 * 1024):.2f} MB")
         print(f"    SHA256: {sha256_file(final_deb_path)}")
         return final_deb_path
+
+    def _setup_cli_package(self, extract_dir: Path, staging_root: Path) -> None:
+        """Setup standard Unix CLI layout for Antigravity CLI."""
+        usr_bin = staging_root / "usr" / "bin"
+        usr_bin.mkdir(parents=True, exist_ok=True)
+
+        bin_candidates = [p for p in extract_dir.rglob("*") if p.is_file() and not p.is_symlink()]
+        if not bin_candidates:
+            raise RuntimeError("No binary found in CLI archive")
+
+        src_bin = bin_candidates[0]
+        for c in bin_candidates:
+            if c.name in ("antigravity", "agy"):
+                src_bin = c
+                break
+
+        # Main command: /usr/bin/agy
+        dest_bin = usr_bin / "agy"
+        shutil.copy2(src_bin, dest_bin)
+        dest_bin.chmod(0o755)
+
+        # Alias symlink: /usr/bin/antigravity-cli -> agy
+        cli_symlink = usr_bin / "antigravity-cli"
+        if not cli_symlink.exists() and not cli_symlink.is_symlink():
+            cli_symlink.symlink_to("agy")
+
+        # Set permissions for staging files
+        for p in staging_root.rglob("*"):
+            if p.is_dir():
+                p.chmod(0o755)
+            elif p.is_file():
+                p.chmod(0o755 if os.access(p, os.X_OK) else 0o644)
 
     def _setup_executable(self, opt_app_dir: Path, staging_root: Path) -> Tuple[str, Path]:
         """Detect the main binary and create /usr/bin launcher."""
@@ -556,26 +635,41 @@ Terminal=false
 
         if self.product == "antigravity":
             pkg_name = "antigravity"
+            section = "devel"
+            deps = dependencies
             description = (
                 "Google Antigravity 2.0 Desktop Application\n"
                 " Unified agentic coding platform with autonomous background task runners,\n"
                 " interactive chat canvas, and multi-agent orchestration."
             )
-        else:
+        elif self.product == "antigravity-ide":
             pkg_name = "antigravity-ide"
+            section = "devel"
+            deps = dependencies
             description = (
                 "Google Antigravity IDE\n"
                 " AI-first integrated development environment built for seamless\n"
                 " agentic workflows, autocomplete, and inline editing."
             )
+        elif self.product == "antigravity-cli":
+            pkg_name = "antigravity-cli"
+            section = "utils"
+            deps = "ca-certificates, libc6"
+            description = (
+                "Google Antigravity CLI (agy)\n"
+                " Autonomous agentic command-line interface for terminal-driven coding,\n"
+                " multi-agent orchestration, and background task execution."
+            )
+        else:
+            raise ValueError(f"Unknown product: {self.product}")
 
         control_content = f"""Package: {pkg_name}
 Version: {self.version}
-Section: devel
+Section: {section}
 Priority: optional
 Architecture: {self.deb_arch}
 Maintainer: Antigravity Community <noreply@antigravity.google>
-Depends: {dependencies}
+Depends: {deps}
 Homepage: https://antigravity.google
 Description: {description}
 """
@@ -583,7 +677,17 @@ Description: {description}
             f.write(control_content)
         (debian_dir / "control").chmod(0o644)
 
-        postinst_content = """#!/bin/sh
+        if self.product == "antigravity-cli":
+            postinst_content = """#!/bin/sh
+set -e
+exit 0
+"""
+            postrm_content = """#!/bin/sh
+set -e
+exit 0
+"""
+        else:
+            postinst_content = """#!/bin/sh
 set -e
 
 if which update-desktop-database >/dev/null 2>&1; then
@@ -602,12 +706,7 @@ fi
 
 exit 0
 """
-        postinst_file = debian_dir / "postinst"
-        with open(postinst_file, "w", encoding="utf-8") as f:
-            f.write(postinst_content)
-        postinst_file.chmod(0o755)
-
-        postrm_content = """#!/bin/sh
+            postrm_content = """#!/bin/sh
 set -e
 
 if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
@@ -628,6 +727,11 @@ fi
 
 exit 0
 """
+        postinst_file = debian_dir / "postinst"
+        with open(postinst_file, "w", encoding="utf-8") as f:
+            f.write(postinst_content)
+        postinst_file.chmod(0o755)
+
         postrm_file = debian_dir / "postrm"
         with open(postrm_file, "w", encoding="utf-8") as f:
             f.write(postrm_content)
@@ -635,7 +739,7 @@ exit 0
 
 
 def list_releases() -> None:
-    """Print available releases for both products."""
+    """Print available releases for all products."""
     print("==================================================")
     print("  Antigravity 2.0 (Hub/Engine) Releases")
     print("==================================================")
@@ -655,12 +759,23 @@ def list_releases() -> None:
     else:
         for r in ide_releases[:10]:
             print(f"  - Version: {r['version']} (execution_id: {r.get('execution_id', 'N/A')})")
+
+    print("\n==================================================")
+    print("  Antigravity CLI Releases")
+    print("==================================================")
+    cli_releases = ReleaseResolver.fetch_cli_releases()
+    if not cli_releases:
+        print("  (No releases found)")
+    else:
+        for r in cli_releases:
+            print(f"  - Version: {r['version']} (execution_id: {r.get('execution_id', 'N/A')})")
     print()
 
 
 def check_updates(
     version_file_path: Path,
     force: bool = False,
+    target_product: Optional[str] = None,
 ) -> Tuple[bool, Dict[str, Dict[str, str]], List[str]]:
     """
     Check if upstream has newer releases than recorded in version_file.
@@ -670,9 +785,10 @@ def check_updates(
     latest_map = ReleaseResolver.get_latest_versions()
     recorded_versions = load_version_file(version_file_path)
 
+    check_prods = ALL_PRODUCTS if (not target_product or target_product in ("both", "all")) else [target_product]
     updated_products = []
     print("[*] Checking for updates against recorded versions:", file=sys.stderr)
-    for prod in ["antigravity", "antigravity-ide"]:
+    for prod in check_prods:
         upstream_ver = latest_map[prod]["version"]
         rec_ver = recorded_versions.get(prod)
 
@@ -708,13 +824,15 @@ def generate_matrix_json(
     has_update, latest_map, updated_products = check_updates(
         version_file_path=version_file,
         force=force,
+        target_product=product_req,
     )
 
     hub_rel = latest_map["antigravity"]
     ide_rel = latest_map["antigravity-ide"]
+    cli_rel = latest_map["antigravity-cli"]
 
-    all_products = ["antigravity", "antigravity-ide"] if product_req == "both" else [product_req]
-    arches = ["amd64", "arm64"] if arch_req == "both" else [arch_req]
+    all_products = ALL_PRODUCTS if product_req in ("both", "all") else [product_req]
+    arches = ["amd64", "arm64"] if arch_req in ("both", "all") else [arch_req]
 
     # Filter target products
     if check_update_mode and not force:
@@ -741,14 +859,20 @@ def generate_matrix_json(
         "should_build": should_build,
         "hub_version": hub_rel["version"],
         "ide_version": ide_rel["version"],
+        "cli_version": cli_rel["version"],
         "updated_products": target_products,
         "matrix": matrix_list,
     }
 
 
-def generate_release_notes(hub_version: str, ide_version: str, out_file: Optional[Path] = None) -> str:
+def generate_release_notes(
+    hub_version: str,
+    ide_version: str,
+    cli_version: str,
+    out_file: Optional[Path] = None,
+) -> str:
     """Generate Markdown release notes for GitHub Releases."""
-    notes = f"""## 🚀 Google Antigravity & Antigravity IDE Linux (.deb) Releases
+    notes = f"""## 🚀 Google Antigravity, Antigravity IDE & CLI Linux (.deb) Releases
 
 Automated Debian packages built directly from official Google Antigravity release archives.
 
@@ -756,12 +880,14 @@ Automated Debian packages built directly from official Google Antigravity releas
 
 ### 📦 Packages in this Release
 
-| Application | Version | Arch | Package Name |
-| :--- | :--- | :--- | :--- |
-| **Antigravity 2.0** | `{hub_version}` | `amd64` | `antigravity_{hub_version}_amd64.deb` |
-| **Antigravity 2.0** | `{hub_version}` | `arm64` | `antigravity_{hub_version}_arm64.deb` |
-| **Antigravity IDE** | `{ide_version}` | `amd64` | `antigravity-ide_{ide_version}_amd64.deb` |
-| **Antigravity IDE** | `{ide_version}` | `arm64` | `antigravity-ide_{ide_version}_arm64.deb` |
+| Application | Version | Arch | Package Name | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| **Antigravity 2.0** | `{hub_version}` | `amd64` | `antigravity_{hub_version}_amd64.deb` | Agentic desktop workspace & platform |
+| **Antigravity 2.0** | `{hub_version}` | `arm64` | `antigravity_{hub_version}_arm64.deb` | Agentic desktop workspace & platform |
+| **Antigravity IDE** | `{ide_version}` | `amd64` | `antigravity-ide_{ide_version}_amd64.deb` | AI-first coding editor |
+| **Antigravity IDE** | `{ide_version}` | `arm64` | `antigravity-ide_{ide_version}_arm64.deb` | AI-first coding editor |
+| **Antigravity CLI** | `{cli_version}` | `amd64` | `antigravity-cli_{cli_version}_amd64.deb` | Command-line interface (`agy`) |
+| **Antigravity CLI** | `{cli_version}` | `arm64` | `antigravity-cli_{cli_version}_arm64.deb` | Command-line interface (`agy`) |
 
 ---
 
@@ -769,17 +895,19 @@ Automated Debian packages built directly from official Google Antigravity releas
 
 #### Ubuntu / Debian / Pop!_OS / Linux Mint
 ```bash
-# 1. Download the deb package for your architecture
-# 2. Install with apt (automatically resolves dependencies):
+# 1. Download the deb packages for your architecture
+# 2. Install with apt (automatically resolves any dependencies):
 sudo apt update
 sudo apt install ./antigravity_{hub_version}_amd64.deb
 sudo apt install ./antigravity-ide_{ide_version}_amd64.deb
+sudo apt install ./antigravity-cli_{cli_version}_amd64.deb
 ```
 
 #### Launching
 - Run `antigravity` to launch Antigravity 2.0 Desktop Platform.
 - Run `antigravity-ide` (or `agy-ide`) to launch Antigravity IDE.
-- Both applications are integrated into your desktop application menu.
+- Run `agy` (or `antigravity-cli`) to use the Antigravity CLI tool in terminal.
+- Desktop applications are integrated into your desktop application menu.
 
 ---
 *Upstream releases sourced from [https://antigravity.google/releases](https://antigravity.google/releases).*
@@ -793,7 +921,7 @@ sudo apt install ./antigravity-ide_{ide_version}_amd64.deb
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Repackage Google Antigravity 2.0 & Antigravity IDE into Debian (.deb) packages"
+        description="Repackage Google Antigravity 2.0, IDE & CLI into Debian (.deb) packages"
     )
     parser.add_argument(
         "--list",
@@ -817,13 +945,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--product",
-        choices=["antigravity", "antigravity-ide", "both"],
-        default="both",
-        help="Product to build (default: both)",
+        choices=["antigravity", "antigravity-ide", "antigravity-cli", "both", "all"],
+        default="all",
+        help="Product to build (default: all)",
     )
     parser.add_argument(
         "--arch",
-        choices=["amd64", "arm64", "both"],
+        choices=["amd64", "arm64", "both", "all"],
         default="amd64",
         help="Debian architecture (amd64, arm64, or both; default: amd64)",
     )
@@ -876,6 +1004,7 @@ def main() -> None:
     has_update, latest_map, updated_products = check_updates(
         version_file_path=version_file,
         force=args.force,
+        target_product=args.product,
     )
 
     if args.check_update and not has_update and not args.force:
@@ -883,8 +1012,8 @@ def main() -> None:
         sys.exit(0)
 
     # Determine which products to build
-    if args.product == "both":
-        products_to_build = updated_products if (args.check_update and not args.force) else ["antigravity", "antigravity-ide"]
+    if args.product in ("both", "all"):
+        products_to_build = updated_products if (args.check_update and not args.force) else ALL_PRODUCTS
     else:
         if args.check_update and not args.force and args.product not in updated_products:
             print(f"\n[i] Product '{args.product}' is already up-to-date. Exiting.")
@@ -899,12 +1028,13 @@ def main() -> None:
         notes = generate_release_notes(
             latest_map["antigravity"]["version"],
             latest_map["antigravity-ide"]["version"],
+            latest_map["antigravity-cli"]["version"],
             Path(args.generate_release_notes),
         )
         print(notes)
         return
 
-    arches = ["amd64", "arm64"] if args.arch == "both" else [args.arch]
+    arches = ["amd64", "arm64"] if args.arch in ("both", "all") else [args.arch]
     out_dir = Path(args.out_dir).resolve()
     cache_dir = Path(args.cache_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)

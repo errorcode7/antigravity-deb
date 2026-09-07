@@ -1,6 +1,6 @@
-# Google Antigravity & Antigravity IDE .deb 自动化打包发布工作流
+# Google Antigravity, Antigravity IDE & CLI .deb 自动化打包发布工作流
 
-本项目实现了从 [https://antigravity.google/releases](https://antigravity.google/releases) 自动获取 **Antigravity 2.0** 与 **Antigravity IDE** 的最新版本。**具备智能版本更新检测机制：仅在上游发布新版本时才执行下载与打包；若版本未更新，则自动跳过所有下载与构建流程。**
+本项目实现了从官方 API 自动获取 **Antigravity 2.0**（桌面平台）、**Antigravity IDE**（编程编辑器）和 **Antigravity CLI**（命令行终端工具 `agy`）的最新版本。**具备智能版本更新检测机制：仅在上游发布新版本时才执行下载与打包；若版本未更新，则自动跳过所有下载与构建流程。**
 
 ---
 
@@ -12,23 +12,21 @@
   - **若版本未更新**：立刻退出流程，**不发起任何大文件下载、不解析压缩包**，极大节约带宽与 GitHub Actions 运行额度。
   - **若任一产品更新**：仅对更新的产品拉取新版本、打包并发布 Release。
   - **支持强制构建 (`--force`)**：需要重新打包时可直接绕过版本检查。
-- 🔍 **双源解析策略**：
-  - 首选调用官方 Cloud Run Auto-Updater API 端点：
-    - Antigravity 2.0: `https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/releases`
-    - Antigravity IDE: `https://antigravity-ide-auto-updater-974169037036.us-central1.run.app/releases`
-  - 备用解析 `https://antigravity.google/releases` 页面内置的 `data-static-versions` / `data-fallback-ide` 属性。
-- 📦 **标准 Debian 规范打包**：
-  - 应用目录置于 `/opt/antigravity` 与 `/opt/antigravity-ide`。
-  - 命令行入口安装至 `/usr/bin/antigravity`、`/usr/bin/antigravity-ide`（附带 `agy-ide` 别名）。
-  - 自动集成桌面启动器（`.desktop`）与官方高分辨率应用图标。
+- 🔍 **官方多源 API 实时解析**：
+  - Antigravity 2.0: `https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/releases`
+  - Antigravity IDE: `https://antigravity-ide-auto-updater-974169037036.us-central1.run.app/releases`
+  - Antigravity CLI: `https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/`
+- 📦 **标准 Debian 规范打包（三者零冲突，支持完全共存）**：
+  - **`antigravity`**：应用置于 `/opt/antigravity`，启动命令 `/usr/bin/antigravity`，集成桌面快捷方式与高分图标。
+  - **`antigravity-ide`**：应用置于 `/opt/antigravity-ide`，启动命令 `/usr/bin/antigravity-ide`（别名 `agy-ide`）。
+  - **`antigravity-cli`**：二进制直接安装至 `/usr/bin/agy`（软链 `antigravity-cli`），全局可用，轻量免额外依赖。
   - 自动修复 Electron `chrome-sandbox` 提权权限（`chmod 4755`）。
-  - 完整声明依赖项（`libgtk-3-0`、`libnss3`、`libasound2 | libasound2t64` 等），支持通过 `apt` 自动补齐依赖。
-  - 附带 `postinst` 与 `postrm` 维护脚本，安装/卸载时自动更新系统图标与桌面缓存。
+  - 完整声明依赖项（`libpango-1.0-0`、`libgtk-3-0`、`libnss3` 等），支持通过 `apt` 自动补齐。
 - ⚡ **多架构支持**：
   - 同时支持 `amd64` (x86_64) 与 `arm64` (AArch64)。
 - 🚀 **GitHub Actions CI/CD 流水线**：
-  - **定时自动检测 (`schedule`)**：每日定时检查官方版本，有更新才触发矩阵并发下载与打包；无更新时 10 秒内优雅退出。
-  - **手动触发 (`workflow_dispatch`)**：支持勾选 `force_build` 强制重构。
+  - **定时自动检测 (`schedule`)**：每日定时检查官方版本，有更新才触发矩阵**并发下载与打包**（多架构、多产品独立 runner 并发执行）。
+  - **手动触发 (`workflow_dispatch`)**：支持勾选 `force_build` 强制重构指定产品或架构。
   - 自动生成 `SHA256SUMS.txt` 校验清单并发布 GitHub Release。
 
 ---
@@ -117,8 +115,10 @@ git push -u origin main
 sudo apt update
 sudo apt install ./antigravity_2.12.2_amd64.deb
 sudo apt install ./antigravity-ide_2.5.5_amd64.deb
+sudo apt install ./antigravity-cli_1.1.27_amd64.deb
 
 # 启动应用：
-antigravity       # 启动 Antigravity 2.0
+antigravity       # 启动 Antigravity 2.0 桌面端
 antigravity-ide   # 启动 Antigravity IDE (也可以使用别名 agy-ide)
+agy               # 启动 Antigravity CLI 命令行终端（也可使用别名 antigravity-cli）
 ```

@@ -11,12 +11,13 @@ on:
       product:
         description: "Product to package"
         required: true
-        default: "both"
+        default: "all"
         type: choice
         options:
-          - "both"
+          - "all"
           - "antigravity"
           - "antigravity-ide"
+          - "antigravity-cli"
       arch:
         description: "Target architecture"
         required: true
@@ -48,6 +49,7 @@ jobs:
       matrix: ${{ steps.check.outputs.matrix }}
       hub_version: ${{ steps.check.outputs.hub_version }}
       ide_version: ${{ steps.check.outputs.ide_version }}
+      cli_version: ${{ steps.check.outputs.cli_version }}
       should_build: ${{ steps.check.outputs.should_build }}
       updated: ${{ steps.check.outputs.updated }}
       publish_release: ${{ steps.check.outputs.publish_release }}
@@ -68,7 +70,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           FORCE="${{ github.event.inputs.force_build == 'true' }}"
-          PROD="${{ github.event.inputs.product || 'both' }}"
+          PROD="${{ github.event.inputs.product || 'all' }}"
           ARCH="${{ github.event.inputs.arch || 'both' }}"
           PUBLISH="${{ github.event.inputs.publish_release != 'false' }}"
 
@@ -90,17 +92,19 @@ jobs:
           SHOULD_BUILD=$(echo "$MATRIX_JSON" | jq -r .should_build)
           HUB_VER=$(echo "$MATRIX_JSON" | jq -r .hub_version)
           IDE_VER=$(echo "$MATRIX_JSON" | jq -r .ide_version)
+          CLI_VER=$(echo "$MATRIX_JSON" | jq -r .cli_version)
           MATRIX=$(echo "$MATRIX_JSON" | jq -c .matrix)
 
           echo "updated=$UPDATED" >> $GITHUB_OUTPUT
           echo "should_build=$SHOULD_BUILD" >> $GITHUB_OUTPUT
           echo "hub_version=$HUB_VER" >> $GITHUB_OUTPUT
           echo "ide_version=$IDE_VER" >> $GITHUB_OUTPUT
+          echo "cli_version=$CLI_VER" >> $GITHUB_OUTPUT
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
           echo "publish_release=$PUBLISH" >> $GITHUB_OUTPUT
 
           if [ "$SHOULD_BUILD" != "true" ]; then
-            echo "::notice ::No updates found (Antigravity 2.0: $HUB_VER, Antigravity IDE: $IDE_VER). Skipping download and packaging."
+            echo "::notice ::No updates found (Antigravity 2.0: $HUB_VER, IDE: $IDE_VER, CLI: $CLI_VER). Skipping download and packaging."
           else
             echo "::notice ::Updates detected! Building targets: $(echo "$MATRIX_JSON" | jq -c .updated_products)"
           fi
@@ -186,8 +190,9 @@ jobs:
         run: |
           HUB_VER="${{ needs.resolve.outputs.hub_version }}"
           IDE_VER="${{ needs.resolve.outputs.ide_version }}"
+          CLI_VER="${{ needs.resolve.outputs.cli_version }}"
           TAG="v${HUB_VER}-${IDE_VER}"
-          TITLE="Google Antigravity 2.0 (v${HUB_VER}) & IDE (v${IDE_VER})"
+          TITLE="Google Antigravity 2.0 (v${HUB_VER}), IDE (v${IDE_VER}) & CLI (v${CLI_VER})"
 
           echo "[*] Publishing release $TAG..."
           if gh release view "$TAG" >/dev/null 2>&1; then
@@ -205,8 +210,9 @@ jobs:
         run: |
           HUB_VER="${{ needs.resolve.outputs.hub_version }}"
           IDE_VER="${{ needs.resolve.outputs.ide_version }}"
+          CLI_VER="${{ needs.resolve.outputs.cli_version }}"
 
-          echo "{\"antigravity\": \"$HUB_VER\", \"antigravity-ide\": \"$IDE_VER\"}" > versions.json
+          echo "{\"antigravity\": \"$HUB_VER\", \"antigravity-ide\": \"$IDE_VER\", \"antigravity-cli\": \"$CLI_VER\"}" > versions.json
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -214,6 +220,6 @@ jobs:
           if git diff --staged --quiet; then
             echo "[i] versions.json unchanged. Nothing to commit."
           else
-            git commit -m "chore: bump tracked versions to Antigravity $HUB_VER, IDE $IDE_VER [skip ci]"
+            git commit -m "chore: bump tracked versions to Antigravity $HUB_VER, IDE $IDE_VER, CLI $CLI_VER [skip ci]"
             git push
           fi
