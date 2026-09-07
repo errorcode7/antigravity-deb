@@ -524,12 +524,6 @@ Terminal=false
         if not usr_share_link.exists() and not usr_share_link.is_symlink():
             usr_share_link.symlink_to(f"/opt/{self.product}")
 
-        # If product is antigravity-ide, also provide /usr/share/antigravity symlink for legacy shortcuts
-        if self.product == "antigravity-ide":
-            legacy_link = usr_share_dir / "antigravity"
-            if not legacy_link.exists() and not legacy_link.is_symlink():
-                legacy_link.symlink_to(f"/opt/{self.product}")
-
     def _fix_permissions(self, staging_root: Path, opt_app_dir: Path) -> None:
         """Fix permissions for Debian standards and Chrome Sandbox."""
         chrome_sandbox = opt_app_dir / "chrome-sandbox"
