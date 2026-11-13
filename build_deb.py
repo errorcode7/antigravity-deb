@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -82,6 +83,104 @@ def http_get(url: str, timeout: int = 20) -> bytes:
             except Exception:
                 pass
         return raw
+
+
+def check_url_exists(url: str, timeout: int = 5) -> bool:
+    """Check if a remote resource exists using a fast HEAD request."""
+    try:
+        req = urllib.request.Request(
+            url,
+            method="HEAD",
+            headers={"User-Agent": USER_AGENT},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def extract_icon_from_asar(asar_path: Path, dest_png: Path) -> bool:
+    """
+    Extract built-in high-resolution icon from Electron app.asar archive
+    using standard Chromium pickle protocol (pure Python standard library).
+    """
+    if not asar_path.is_file():
+        return False
+    try:
+        with open(asar_path, "rb") as f:
+            header_prefix = f.read(16)
+            if len(header_prefix) < 16:
+                return False
+            pickle_size = struct.unpack("<I", header_prefix[:4])[0]
+            payload_size = struct.unpack("<I", header_prefix[4:8])[0]
+            header_str_len = struct.unpack("<I", header_prefix[8:12])[0]
+            json_len = struct.unpack("<I", header_prefix[12:16])[0]
+            json_bytes = f.read(json_len)
+            tree = json.loads(json_bytes.decode("utf-8"))
+            base_offset = 8 + payload_size
+
+            def walk_files(d: dict, prefix: str = ""):
+                for name, node in d.get("files", {}).items():
+                    sub = f"{prefix}/{name}" if prefix else name
+                    if isinstance(node, dict) and "files" in node:
+                        yield from walk_files(node, sub)
+                    else:
+                        yield sub, node
+
+            files_map = dict(walk_files(tree))
+
+            # Preferred icon paths in Antigravity app.asar
+            priority_names = [
+                "icon.png",
+                "resources/icon.png",
+                "app.png",
+                "antigravity.png",
+                "logo.png",
+                "static/icon.png",
+                "assets/icon.png",
+            ]
+            chosen_entry = None
+            for p in priority_names:
+                if p in files_map and isinstance(files_map[p], dict) and "size" in files_map[p] and "offset" in files_map[p]:
+                    chosen_entry = files_map[p]
+                    break
+
+            if not chosen_entry:
+                # Fallback to any standalone png
+                for p, v in files_map.items():
+                    if isinstance(v, dict) and p.endswith(".png") and "node_modules" not in p and v.get("size", 0) > 4096:
+                        chosen_entry = v
+                        break
+
+            if chosen_entry:
+                offset = int(chosen_entry["offset"])
+                size = int(chosen_entry["size"])
+                f.seek(base_offset + offset)
+                data = f.read(size)
+                if data.startswith(b"\x89PNG"):
+                    dest_png.parent.mkdir(parents=True, exist_ok=True)
+                    dest_png.write_bytes(data)
+                    print(f"[✓] Extracted built-in icon from app.asar ({size} bytes) -> {dest_png.name}")
+                    return True
+    except Exception as e:
+        print(f"[WARN] Failed to extract icon from asar {asar_path}: {e}", file=sys.stderr)
+    return False
+
+
+def install_hicolor_icons(src_png: Path, hicolor_dir: Path, icon_name: str) -> None:
+    """Generate and install icons for various standard hicolor sizes."""
+    try:
+        from PIL import Image
+        with Image.open(src_png) as img:
+            for size in (256, 128, 64, 48, 32):
+                size_dir = hicolor_dir / f"{size}x{size}" / "apps"
+                size_dir.mkdir(parents=True, exist_ok=True)
+                dest = size_dir / f"{icon_name}.png"
+                if not dest.exists():
+                    resized = img.resize((size, size), Image.Resampling.LANCZOS)
+                    resized.save(dest, "PNG")
+    except Exception:
+        pass
 
 
 def parse_version_tuple(v_str: str) -> Tuple[int, ...]:
@@ -199,7 +298,7 @@ class ReleaseResolver:
 
     @staticmethod
     def get_latest_versions() -> Dict[str, Dict[str, str]]:
-        """Retrieve latest release info for Antigravity 2.0, IDE, and CLI."""
+        """Retrieve latest release info for Antigravity 2.0, IDE, and CLI, verifying Linux availability."""
         hub = ReleaseResolver.fetch_hub_releases()
         ide = ReleaseResolver.fetch_ide_releases()
         cli = ReleaseResolver.fetch_cli_releases()
@@ -209,9 +308,31 @@ class ReleaseResolver:
             raise RuntimeError("Failed to fetch Antigravity IDE releases")
         if not cli:
             raise RuntimeError("Failed to fetch Antigravity CLI releases")
+
+        # Pick the latest release that actually has published Linux binaries
+        latest_hub = hub[0]
+        for candidate in hub:
+            v = candidate.get("version", "")
+            eid = candidate.get("execution_id", "1")
+            deb_url = f"https://storage.googleapis.com/antigravity-public/antigravity-hub/{v}-{eid}/linux-x64/Antigravity.deb"
+            tar_url = f"https://storage.googleapis.com/antigravity-public/antigravity-hub/{v}-{eid}/linux-x64/Antigravity.tar.gz"
+            if check_url_exists(deb_url) or check_url_exists(tar_url):
+                latest_hub = candidate
+                break
+
+        latest_ide = ide[0]
+        for candidate in ide:
+            v = candidate.get("version", "")
+            eid = candidate.get("execution_id", "1")
+            deb_url = f"https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/{v}-{eid}/linux-x64/Antigravity%20IDE.deb"
+            tar_url = f"https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/{v}-{eid}/linux-x64/Antigravity%20IDE.tar.gz"
+            if check_url_exists(deb_url) or check_url_exists(tar_url):
+                latest_ide = candidate
+                break
+
         return {
-            "antigravity": hub[0],
-            "antigravity-ide": ide[0],
+            "antigravity": latest_hub,
+            "antigravity-ide": latest_ide,
             "antigravity-cli": cli[0],
         }
 
@@ -219,29 +340,47 @@ class ReleaseResolver:
     def get_download_url(product: str, version: str, execution_id: str, deb_arch: str) -> str:
         """
         Construct download URL based on product, version, execution_id, and architecture.
+        Prioritizes official .deb package if upstream provides it, falling back to .tar.gz.
         """
         platform = ARCH_MAP.get(deb_arch.lower(), "linux-x64")
         if product == "antigravity":
-            return (
+            deb_url = (
+                f"https://storage.googleapis.com/antigravity-public/antigravity-hub/"
+                f"{version}-{execution_id}/{platform}/Antigravity.deb"
+            )
+            tar_url = (
                 f"https://storage.googleapis.com/antigravity-public/antigravity-hub/"
                 f"{version}-{execution_id}/{platform}/Antigravity.tar.gz"
             )
+            if check_url_exists(deb_url):
+                return deb_url
+            return tar_url
         elif product == "antigravity-ide":
-            return (
+            deb_url = (
+                f"https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/"
+                f"{version}-{execution_id}/{platform}/Antigravity%20IDE.deb"
+            )
+            tar_url = (
                 f"https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/"
                 f"{version}-{execution_id}/{platform}/Antigravity%20IDE.tar.gz"
             )
+            if check_url_exists(deb_url):
+                return deb_url
+            return tar_url
         elif product == "antigravity-cli":
-            if deb_arch in ("arm64", "aarch64"):
-                return (
-                    f"https://storage.googleapis.com/antigravity-public/antigravity-cli/"
-                    f"{version}-{execution_id}/linux-arm/cli_linux_arm64.tar.gz"
-                )
-            else:
-                return (
-                    f"https://storage.googleapis.com/antigravity-public/antigravity-cli/"
-                    f"{version}-{execution_id}/linux-x64/cli_linux_x64.tar.gz"
-                )
+            arch_dir = "linux-arm" if deb_arch in ("arm64", "aarch64") else "linux-x64"
+            arch_file = "cli_linux_arm64" if deb_arch in ("arm64", "aarch64") else "cli_linux_x64"
+            deb_url = (
+                f"https://storage.googleapis.com/antigravity-public/antigravity-cli/"
+                f"{version}-{execution_id}/{arch_dir}/{arch_file}.deb"
+            )
+            tar_url = (
+                f"https://storage.googleapis.com/antigravity-public/antigravity-cli/"
+                f"{version}-{execution_id}/{arch_dir}/{arch_file}.tar.gz"
+            )
+            if check_url_exists(deb_url):
+                return deb_url
+            return tar_url
         else:
             raise ValueError(f"Unknown product: {product}")
 
@@ -377,34 +516,59 @@ class DebPackager:
             print(f"[*] Extracting {self.archive_path.name}...")
             extract_dir = build_root / "extract"
             extract_dir.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
-                ["tar", "-zxf", str(self.archive_path), "-C", str(extract_dir)],
-                check=True,
-            )
+            if self.archive_path.suffix == ".deb":
+                subprocess.run(
+                    ["dpkg-deb", "-x", str(self.archive_path), str(extract_dir)],
+                    check=True,
+                )
+            else:
+                subprocess.run(
+                    ["tar", "-zxf", str(self.archive_path), "-C", str(extract_dir)],
+                    check=True,
+                )
 
             if self.product == "antigravity-cli":
                 print(f"[*] Setting up packaging structure for {self.product}...")
                 self._setup_cli_package(extract_dir, staging_root)
             else:
-                # Locate top-level extracted directory
-                entries = list(extract_dir.iterdir())
-                if len(entries) == 1 and entries[0].is_dir():
-                    payload_source = entries[0]
+                # Handle Debian package structure (with /opt and /usr) or .tar.gz directory
+                extracted_opt = extract_dir / "opt"
+                if extracted_opt.is_dir():
+                    opt_dirs = [d for d in extracted_opt.iterdir() if d.is_dir()]
+                    payload_source = opt_dirs[0] if opt_dirs else extracted_opt
+                    extracted_usr = extract_dir / "usr"
+                    if extracted_usr.is_dir():
+                        staging_usr = staging_root / "usr"
+                        shutil.copytree(str(extracted_usr), str(staging_usr), dirs_exist_ok=True)
                 else:
-                    payload_source = extract_dir
+                    # Locate top-level extracted directory
+                    entries = list(extract_dir.iterdir())
+                    if len(entries) == 1 and entries[0].is_dir():
+                        payload_source = entries[0]
+                    else:
+                        payload_source = extract_dir
 
                 opt_app_dir = staging_root / "opt" / self.product
                 opt_app_dir.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(payload_source), str(opt_app_dir))
+
+                # Provide compatibility symlink for /opt/Antigravity -> /opt/antigravity
+                if self.product == "antigravity":
+                    alt_opt = staging_root / "opt" / "Antigravity"
+                    if not alt_opt.exists() and not alt_opt.is_symlink():
+                        alt_opt.symlink_to(self.product)
 
                 print(f"[*] Setting up packaging structure for {self.product}...")
                 # 1. Executable launcher
                 exe_name, exe_path = self._setup_executable(opt_app_dir, staging_root)
 
                 # 2. Desktop entry & icons
-                self._setup_desktop_and_icons(opt_app_dir, staging_root, exe_name)
+                self._setup_desktop_and_icons(opt_app_dir, staging_root, exe_name, extract_dir)
 
-                # 3. Permissions
+                # 3. AppArmor profile (Ubuntu 24.04+ compatibility)
+                self._setup_apparmor_profile(opt_app_dir, staging_root, extract_dir)
+
+                # 4. Permissions
                 self._fix_permissions(staging_root, opt_app_dir)
 
             # 4. Debian metadata
@@ -449,10 +613,15 @@ class DebPackager:
 
         # Set permissions for staging files
         for p in staging_root.rglob("*"):
-            if p.is_dir():
-                p.chmod(0o755)
-            elif p.is_file():
-                p.chmod(0o755 if os.access(p, os.X_OK) else 0o644)
+            if p.is_symlink():
+                continue
+            try:
+                if p.is_dir():
+                    p.chmod(0o755)
+                elif p.is_file():
+                    p.chmod(0o755 if os.access(p, os.X_OK) else 0o644)
+            except Exception as e:
+                print(f"[WARN] Failed to chmod {p}: {e}", file=sys.stderr)
 
     def _setup_executable(self, opt_app_dir: Path, staging_root: Path) -> Tuple[str, Path]:
         """Detect the main binary and create /usr/bin launcher."""
@@ -519,27 +688,62 @@ exec "{opt_bin_path}" "$@"
 
         return target_bin.name, target_bin
 
-    def _setup_desktop_and_icons(self, opt_app_dir: Path, staging_root: Path, exe_name: str) -> None:
+    def _setup_desktop_and_icons(
+        self,
+        opt_app_dir: Path,
+        staging_root: Path,
+        exe_name: str,
+        extract_dir: Optional[Path] = None,
+    ) -> None:
         """Locate icons and install .desktop file and pixmaps."""
         applications_dir = staging_root / "usr" / "share" / "applications"
         pixmaps_dir = staging_root / "usr" / "share" / "pixmaps"
-        icons_dir = staging_root / "usr" / "share" / "icons" / "hicolor" / "512x512" / "apps"
+        hicolor_dir = staging_root / "usr" / "share" / "icons" / "hicolor"
+        icons_dir = hicolor_dir / "512x512" / "apps"
 
         applications_dir.mkdir(parents=True, exist_ok=True)
         pixmaps_dir.mkdir(parents=True, exist_ok=True)
         icons_dir.mkdir(parents=True, exist_ok=True)
 
+        icon_name = self.product
         icon_source: Optional[Path] = None
-        icon_candidates = [
-            opt_app_dir / "resources" / "app" / "resources" / "linux" / "code.png",
-            opt_app_dir / "resources" / "icon.png",
-            opt_app_dir / "resources" / "app" / "resources" / "icon.png",
+
+        # 1. Check if upstream package already provided an icon in staging or extract usr/share
+        candidates_in_staging = [
+            staging_root / "usr" / "share" / "icons" / "hicolor" / "512x512" / "apps" / f"{icon_name}.png",
+            staging_root / "usr" / "share" / "pixmaps" / f"{icon_name}.png",
         ]
-        for c in icon_candidates:
-            if c.is_file():
+        if extract_dir:
+            candidates_in_staging.extend([
+                extract_dir / "usr" / "share" / "icons" / "hicolor" / "512x512" / "apps" / f"{icon_name}.png",
+                extract_dir / "usr" / "share" / "pixmaps" / f"{icon_name}.png",
+            ])
+        for c in candidates_in_staging:
+            if c.is_file() and c.stat().st_size > 0:
                 icon_source = c
                 break
 
+        # 2. Check standard unpacked application resources
+        if not icon_source:
+            icon_candidates = [
+                opt_app_dir / "resources" / "app" / "resources" / "linux" / "code.png",
+                opt_app_dir / "resources" / "icon.png",
+                opt_app_dir / "resources" / "app" / "resources" / "icon.png",
+            ]
+            for c in icon_candidates:
+                if c.is_file():
+                    icon_source = c
+                    break
+
+        # 3. Check inside Electron app.asar (Antigravity stores its official icon here!)
+        if not icon_source:
+            asar_path = opt_app_dir / "resources" / "app.asar"
+            if asar_path.is_file():
+                temp_icon = (extract_dir / f"{icon_name}_native.png") if extract_dir else (staging_root.parent / f"{icon_name}_native.png")
+                if extract_icon_from_asar(asar_path, temp_icon):
+                    icon_source = temp_icon
+
+        # 4. Search recursively for any high-resolution PNG in opt_app_dir
         if not icon_source:
             best_size = 0
             for p in opt_app_dir.rglob("*.png"):
@@ -550,10 +754,16 @@ exec "{opt_bin_path}" "$@"
                     best_size = size
                     icon_source = p
 
-        icon_name = self.product
+        # Install icons
         if icon_source and icon_source.is_file():
-            shutil.copy2(icon_source, pixmaps_dir / f"{icon_name}.png")
-            shutil.copy2(icon_source, icons_dir / f"{icon_name}.png")
+            dest_pixmap = pixmaps_dir / f"{icon_name}.png"
+            if icon_source.resolve() != dest_pixmap.resolve():
+                shutil.copy2(icon_source, dest_pixmap)
+            dest_icon = icons_dir / f"{icon_name}.png"
+            if icon_source.resolve() != dest_icon.resolve():
+                shutil.copy2(icon_source, dest_icon)
+            install_hicolor_icons(icon_source, hicolor_dir, icon_name)
+            print(f"[✓] Using native icon for {icon_name}: {icon_source.name}")
         else:
             svg_content = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
   <rect width="100" height="100" rx="20" fill="#1e1e2e"/>
@@ -597,11 +807,32 @@ Terminal=false
             f.write(desktop_content)
         desktop_file.chmod(0o644)
 
-        # Compatibility symlink: /usr/share/<product> -> /opt/<product>
-        usr_share_dir = staging_root / "usr" / "share"
-        usr_share_link = usr_share_dir / self.product
-        if not usr_share_link.exists() and not usr_share_link.is_symlink():
-            usr_share_link.symlink_to(f"/opt/{self.product}")
+    def _setup_apparmor_profile(self, opt_app_dir: Path, staging_root: Path, extract_dir: Path) -> None:
+        """Setup AppArmor profile for Ubuntu 24.04+ unprivileged user namespace compatibility."""
+        if self.product != "antigravity":
+            return
+        apparmor_dir = staging_root / "etc" / "apparmor.d"
+        apparmor_dir.mkdir(parents=True, exist_ok=True)
+        target_profile = apparmor_dir / "antigravity"
+
+        upstream_profile = extract_dir / "etc" / "apparmor.d" / "antigravity"
+        if upstream_profile.is_file():
+            shutil.copy2(upstream_profile, target_profile)
+        else:
+            profile_content = """abi <abi/4.0>,
+include <tunables/global>
+
+profile antigravity /opt/antigravity/antigravity flags=(unconfined) {
+  userns,
+  include if exists <local/antigravity>
+}
+"""
+            target_profile.write_text(profile_content, encoding="utf-8")
+        target_profile.chmod(0o644)
+
+        res_profile = opt_app_dir / "resources" / "apparmor-profile"
+        if not res_profile.exists():
+            shutil.copy2(target_profile, res_profile)
 
     def _fix_permissions(self, staging_root: Path, opt_app_dir: Path) -> None:
         """Fix permissions for Debian standards and Chrome Sandbox."""
@@ -610,15 +841,18 @@ Terminal=false
             chrome_sandbox.chmod(0o4755)
 
         for path in staging_root.rglob("*"):
-            if path == chrome_sandbox:
+            if path.is_symlink() or path == chrome_sandbox:
                 continue
-            if path.is_dir():
-                path.chmod(0o755)
-            elif path.is_file():
-                if os.access(path, os.X_OK):
+            try:
+                if path.is_dir():
                     path.chmod(0o755)
-                else:
-                    path.chmod(0o644)
+                elif path.is_file():
+                    if os.access(path, os.X_OK):
+                        path.chmod(0o755)
+                    else:
+                        path.chmod(0o644)
+            except Exception as e:
+                print(f"[WARN] Failed to chmod {path}: {e}", file=sys.stderr)
 
     def _setup_debian_metadata(self, staging_root: Path) -> None:
         """Create DEBIAN/control, postinst, and postrm files."""
@@ -630,7 +864,8 @@ Terminal=false
             "libc6, libcairo2, libcups2, libdbus-1-3, libexpat1, libfontconfig1, libgbm1, "
             "libglib2.0-0, libgtk-3-0, libnspr4, libnss3, libpango-1.0-0, libpangocairo-1.0-0, "
             "libsecret-1-0, libx11-6, libx11-xcb1, libxcb1, libxcomposite1, libxcursor1, "
-            "libxdamage1, libxext6, libxfixes3, libxi6, libxrandr2, libxrender1, libxss1, libxtst6"
+            "libxdamage1, libxext6, libxfixes3, libxi6, libxrandr2, libxrender1, libxss1, libxtst6, "
+            "xdg-utils"
         )
 
         if self.product == "antigravity":
@@ -704,6 +939,19 @@ if which update-mime-database >/dev/null 2>&1; then
     update-mime-database /usr/share/mime || true
 fi
 
+if hash apparmor_status 2>/dev/null && apparmor_status --enabled > /dev/null 2>&1; then
+    APPARMOR_PROFILE_SOURCE='/opt/antigravity/resources/apparmor-profile'
+    APPARMOR_PROFILE_TARGET='/etc/apparmor.d/antigravity'
+    if [ -f "$APPARMOR_PROFILE_SOURCE" ] && hash apparmor_parser 2>/dev/null; then
+        if apparmor_parser --skip-kernel-load --debug "$APPARMOR_PROFILE_SOURCE" > /dev/null 2>&1; then
+            cp -f "$APPARMOR_PROFILE_SOURCE" "$APPARMOR_PROFILE_TARGET"
+            if ! { [ -x '/usr/bin/ischroot' ] && /usr/bin/ischroot; }; then
+                apparmor_parser --replace --write-cache --skip-read-cache "$APPARMOR_PROFILE_TARGET" 2>/dev/null || true
+            fi
+        fi
+    fi
+fi
+
 exit 0
 """
             postrm_content = """#!/bin/sh
@@ -722,6 +970,13 @@ if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
 
     if which update-mime-database >/dev/null 2>&1; then
         update-mime-database /usr/share/mime || true
+    fi
+
+    if [ -f /etc/apparmor.d/antigravity ]; then
+        if hash apparmor_parser 2>/dev/null; then
+            apparmor_parser -R /etc/apparmor.d/antigravity 2>/dev/null || true
+        fi
+        rm -f /etc/apparmor.d/antigravity
     fi
 fi
 
@@ -836,7 +1091,14 @@ def generate_matrix_json(
 
     # Filter target products
     if check_update_mode and not force:
-        target_products = [p for p in all_products if p in updated_products]
+        if not has_update:
+            target_products = []
+        elif product_req in ("both", "all"):
+            # When an update is detected for any product and user requested all/both,
+            # include all products so the GitHub release artifacts are complete.
+            target_products = all_products
+        else:
+            target_products = [p for p in all_products if p in updated_products]
     else:
         target_products = all_products
 
@@ -869,16 +1131,28 @@ def generate_release_notes(
     hub_version: str,
     ide_version: str,
     cli_version: str,
+    hub_eid: str = "",
+    ide_eid: str = "",
+    cli_eid: str = "",
     out_file: Optional[Path] = None,
 ) -> str:
-    """Generate Markdown release notes for GitHub Releases."""
+    """Generate Markdown release notes for GitHub Releases, including upstream direct links."""
+    hub_deb_x64 = f"https://storage.googleapis.com/antigravity-public/antigravity-hub/{hub_version}-{hub_eid}/linux-x64/Antigravity.deb"
+    hub_deb_arm = f"https://storage.googleapis.com/antigravity-public/antigravity-hub/{hub_version}-{hub_eid}/linux-arm/Antigravity.deb"
+    hub_tar_x64 = f"https://storage.googleapis.com/antigravity-public/antigravity-hub/{hub_version}-{hub_eid}/linux-x64/Antigravity.tar.gz"
+    hub_tar_arm = f"https://storage.googleapis.com/antigravity-public/antigravity-hub/{hub_version}-{hub_eid}/linux-arm/Antigravity.tar.gz"
+    ide_tar_x64 = f"https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/{ide_version}-{ide_eid}/linux-x64/Antigravity%20IDE.tar.gz"
+    ide_tar_arm = f"https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/{ide_version}-{ide_eid}/linux-arm/Antigravity%20IDE.tar.gz"
+    cli_tar_x64 = f"https://storage.googleapis.com/antigravity-public/antigravity-cli/{cli_version}-{cli_eid}/linux-x64/cli_linux_x64.tar.gz"
+    cli_tar_arm = f"https://storage.googleapis.com/antigravity-public/antigravity-cli/{cli_version}-{cli_eid}/linux-arm/cli_linux_arm64.tar.gz"
+
     notes = f"""## 🚀 Google Antigravity, Antigravity IDE & CLI Linux (.deb) Releases
 
 Automated Debian packages built directly from official Google Antigravity release archives.
 
 ---
 
-### 📦 Packages in this Release
+### 📦 Packages in this Release (Community Repackaged)
 
 | Application | Version | Arch | Package Name | Description |
 | :--- | :--- | :--- | :--- | :--- |
@@ -888,6 +1162,23 @@ Automated Debian packages built directly from official Google Antigravity releas
 | **Antigravity IDE** | `{ide_version}` | `arm64` | `antigravity-ide_{ide_version}_arm64.deb` | AI-first coding editor |
 | **Antigravity CLI** | `{cli_version}` | `amd64` | `antigravity-cli_{cli_version}_amd64.deb` | Command-line interface (`agy`) |
 | **Antigravity CLI** | `{cli_version}` | `arm64` | `antigravity-cli_{cli_version}_arm64.deb` | Command-line interface (`agy`) |
+
+---
+
+### 🌐 官方上游直链 (Official Upstream Direct Download Links)
+
+如果您偏好直接从 Google 官方存储桶（GCS）或 CDN 下载未经加工的原生安装包，可使用以下官方直链：
+
+| 组件 / 平台 | 架构 | 格式 | 官方原生直链 | 来源 |
+| :--- | :--- | :--- | :--- | :--- |
+| **Antigravity 2.0** | `amd64 (x86_64)` | **官方 `.deb`** | [Antigravity.deb]({hub_deb_x64}) | Google Cloud Storage |
+| **Antigravity 2.0** | `arm64 (AArch64)` | **官方 `.deb`** | [Antigravity.deb]({hub_deb_arm}) | Google Cloud Storage |
+| **Antigravity 2.0** | `amd64 (x86_64)` | 官方 `.tar.gz` | [Antigravity.tar.gz]({hub_tar_x64}) | Google Cloud Storage |
+| **Antigravity 2.0** | `arm64 (AArch64)` | 官方 `.tar.gz` | [Antigravity.tar.gz]({hub_tar_arm}) | Google Cloud Storage |
+| **Antigravity IDE** | `amd64 (x86_64)` | 官方 `.tar.gz` | [Antigravity IDE.tar.gz]({ide_tar_x64}) | Google GVT1 CDN |
+| **Antigravity IDE** | `arm64 (AArch64)` | 官方 `.tar.gz` | [Antigravity IDE.tar.gz]({ide_tar_arm}) | Google GVT1 CDN |
+| **Antigravity CLI** | `amd64 (x86_64)` | 官方 `.tar.gz` | [cli_linux_x64.tar.gz]({cli_tar_x64}) | Google Cloud Storage |
+| **Antigravity CLI** | `arm64 (AArch64)` | 官方 `.tar.gz` | [cli_linux_arm64.tar.gz]({cli_tar_arm}) | Google Cloud Storage |
 
 ---
 
@@ -1013,7 +1304,10 @@ def main() -> None:
 
     # Determine which products to build
     if args.product in ("both", "all"):
-        products_to_build = updated_products if (args.check_update and not args.force) else ALL_PRODUCTS
+        if args.check_update and not args.force:
+            products_to_build = ALL_PRODUCTS if has_update else []
+        else:
+            products_to_build = ALL_PRODUCTS
     else:
         if args.check_update and not args.force and args.product not in updated_products:
             print(f"\n[i] Product '{args.product}' is already up-to-date. Exiting.")
@@ -1026,10 +1320,13 @@ def main() -> None:
 
     if args.generate_release_notes:
         notes = generate_release_notes(
-            latest_map["antigravity"]["version"],
-            latest_map["antigravity-ide"]["version"],
-            latest_map["antigravity-cli"]["version"],
-            Path(args.generate_release_notes),
+            hub_version=latest_map["antigravity"]["version"],
+            ide_version=latest_map["antigravity-ide"]["version"],
+            cli_version=latest_map["antigravity-cli"]["version"],
+            hub_eid=latest_map["antigravity"].get("execution_id", ""),
+            ide_eid=latest_map["antigravity-ide"].get("execution_id", ""),
+            cli_eid=latest_map["antigravity-cli"].get("execution_id", ""),
+            out_file=Path(args.generate_release_notes),
         )
         print(notes)
         return
@@ -1059,7 +1356,8 @@ def main() -> None:
             if args.only_resolve:
                 continue
 
-            archive_name = f"{prod}-{ver}-{arch}.tar.gz"
+            ext = ".deb" if download_url.endswith(".deb") else ".tar.gz"
+            archive_name = f"{prod}-{ver}-{arch}{ext}"
             cached_archive = cache_dir / archive_name
 
             if not cached_archive.exists() or cached_archive.stat().st_size == 0:

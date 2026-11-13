@@ -10,18 +10,19 @@
   - 默认仅抓取最新发布（Latest）。
   - **增量检测**：通过比对 `versions.json` 或 GitHub Release 标签版本。
   - **若版本未更新**：立刻退出流程，**不发起任何大文件下载、不解析压缩包**，极大节约带宽与 GitHub Actions 运行额度。
-  - **若任一产品更新**：仅对更新的产品拉取新版本、打包并发布 Release。
+  - **若任一产品更新**：全量打包最新全家桶并发布 Release。
   - **支持强制构建 (`--force`)**：需要重新打包时可直接绕过版本检查。
-- 🔍 **官方多源 API 实时解析**：
+- 🔍 **官方多源 API 实时解析与官方原生 .deb 直链支持**：
   - Antigravity 2.0: `https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/releases`
   - Antigravity IDE: `https://antigravity-ide-auto-updater-974169037036.us-central1.run.app/releases`
   - Antigravity CLI: `https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/`
+  - **双重选择**：在 GitHub Releases 页面中，既提供社区增强打包的 `.deb` 安装包，也同步列出 Google 官方存储桶原生 `.deb` 直链供用户直接下载。
 - 📦 **标准 Debian 规范打包（三者零冲突，支持完全共存）**：
-  - **`antigravity`**：应用置于 `/opt/antigravity`，启动命令 `/usr/bin/antigravity`，集成桌面快捷方式与高分图标。
+  - **`antigravity`**：应用置于 `/opt/antigravity`，启动命令 `/usr/bin/antigravity`，集成系统桌面快捷方式与从 `app.asar` 提取的官方高分多尺寸图标（512x512 至 32x32）。
   - **`antigravity-ide`**：应用置于 `/opt/antigravity-ide`，启动命令 `/usr/bin/antigravity-ide`（别名 `agy-ide`）。
   - **`antigravity-cli`**：二进制直接安装至 `/usr/bin/agy`（软链 `antigravity-cli`），全局可用，轻量免额外依赖。
-  - 自动修复 Electron `chrome-sandbox` 提权权限（`chmod 4755`）。
-  - 完整声明依赖项（`libpango-1.0-0`、`libgtk-3-0`、`libnss3` 等），支持通过 `apt` 自动补齐。
+  - 自动配置 Ubuntu 24.04+ AppArmor profile 与提权权限。
+  - 完整声明依赖项（`libpango-1.0-0`、`libgtk-3-0`、`libnss3`、`xdg-utils` 等），支持通过 `apt` 自动补齐。
 - ⚡ **多架构支持**：
   - 同时支持 `amd64` (x86_64) 与 `arm64` (AArch64)。
 - 🚀 **GitHub Actions CI/CD 流水线**：
@@ -55,8 +56,9 @@ python3 build_deb.py --check-update
 - 若已是最新版：
   ```
   [*] Checking for updates against recorded versions:
-      - antigravity     : upstream=2.12.2   recorded=2.12.2   -> Up to date (2.12.2)
-      - antigravity-ide : upstream=2.5.5    recorded=2.5.5    -> Up to date (2.5.5)
+      - antigravity     : upstream=2.29.0   recorded=2.29.0   -> Up to date (2.29.0)
+      - antigravity-ide : upstream=2.6.0    recorded=2.6.0    -> Up to date (2.6.0)
+      - antigravity-cli : upstream=1.5.2    recorded=1.5.2    -> Up to date (1.5.2)
   [i] All target products are already up-to-date. No new versions found. Exiting.
   ```
 - 若有新版，会自动列出有更新的产品并开始处理。
@@ -113,9 +115,9 @@ git push -u origin main
 ```bash
 # 使用 apt 本地安装（自动解决依赖）：
 sudo apt update
-sudo apt install ./antigravity_2.12.2_amd64.deb
-sudo apt install ./antigravity-ide_2.5.5_amd64.deb
-sudo apt install ./antigravity-cli_1.1.27_amd64.deb
+sudo apt install ./antigravity_2.29.0_amd64.deb
+sudo apt install ./antigravity-ide_2.6.0_amd64.deb
+sudo apt install ./antigravity-cli_1.5.2_amd64.deb
 
 # 启动应用：
 antigravity       # 启动 Antigravity 2.0 桌面端
